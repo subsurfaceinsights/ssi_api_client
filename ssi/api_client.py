@@ -7,11 +7,13 @@ Subpackage for SSI API client calls and functionality.
 import threading
 import os
 from pprint import pprint
-from typing import Optional
 import requests
 import requests.utils
-import json
 import websocket
+import json
+import time
+from typing import Optional
+import logging
 
 
 class ApiException(Exception):
@@ -30,12 +32,28 @@ class ApiException(Exception):
             return f"{self.request.status_code}: {self.msg}"
         return repr(self.request)
 
+
+
 class JsonWebSocket(websocket.WebSocket):
     """
     WebSocket that sends and receives JSON.
+    and uses pings to keep the connection alive.
     """
-    def __init__(self, ws: websocket.WebSocket):
+    def __init__(self, ws: websocket.WebSocket, ping_interval:  # pylint: disable=super-init-not-called
+                 Optional[int] = None):
         self.__dict__.update(ws.__dict__)
+        self._ping_interval = ping_interval
+        self._ping_thread = None
+        self._start_ping_thread()
+
+    def _start_ping_thread(self):
+        if self._ping_interval and self._ping_interval > 0 and self._ping_thread is None:
+            self._ping_thread = threading.Thread(target=self._keep_alive)
+            self._ping_thread.daemon = True
+            self._ping_thread.start()
+
+    def __del__(self):
+        self._ping_interval = None
 
     def send_json(self, data):
         """
@@ -49,14 +67,44 @@ class JsonWebSocket(websocket.WebSocket):
         """
         return json.loads(self.recv())
 
+    def _keep_alive(self):
+        """
+        Keep the connection alive.
+
+        Note that we do this in a separate thread because the websocket
+        timeouts are directional.  Even if the API server is sending a ton of
+        data, the server will timeout if the client doesn't send anything.
+        """
+        elapsed = 0
+        logging.debug("WebSocket keep alive thread starting.")
+        while self.connected and self._ping_interval:
+            next_check = self._ping_interval - (time.time() - elapsed)
+            if next_check > 0:
+                next_check = min(next_check, 10)
+            else:
+                next_check = 1
+            time.sleep(next_check)
+            if time.time() - elapsed > self._ping_interval:
+                self.ping()
+                logging.debug("WebSocket keep alive ping sent.")
+                elapsed = time.time()
+        logging.debug("WebSocket keep alive thread exiting.")
+
+    def set_ping_interval(self, interval):
+        """
+        Set the ping interval.
+        """
+        self._ping_interval = interval
+        self._start_ping_thread()
+
 class ApiClient():
     """
     Class for simplifying SSI API REST Calls.
     """
 
     def __init__(self,
-                 token: Optional[str] =None,
                  url: Optional[str] =None,
+                 token: Optional[str] =None,
                  project=None):
 
         if not url:
@@ -95,7 +143,7 @@ class ApiClient():
         """
         Check for status errors.
         """
-        if r.status_code != 200:
+        if r.status_code != 200 and r.status_code != 206:
             if r.headers.get('Content-Type', None) == 'application/json':
                 msg = r.json()
             else:
@@ -148,7 +196,7 @@ class ApiClient():
             header=headers,
             **kwargs
         )
-        return JsonWebSocket(ws)
+        return JsonWebSocket(ws, 25)
 
     def call(self, call: str, params: Optional[dict] = None, get_params:
              Optional[dict] = None, method: Optional[str] = None, raw_response:
@@ -193,8 +241,8 @@ class ApiClient():
         headers.update(self._get_request_headers())
         kwargs.update({
             'url': f"{self.url}/api/{call}",
-            'headers': self._get_request_headers(),
-        });
+            'headers': headers,
+        })
         if not params:
             params = {}
         files = kwargs.get('files', None)
@@ -252,8 +300,7 @@ class ApiClient():
                    timeout: int = None, return_handler: callable = None,
                    exception_handler: callable = None):
         """
-        Perform an asynchronous SSI API call. Note that this uses threading, we
-        should support async/await in the future.
+        Perform an asynchronous SSI API call.
         """
 
         thread = threading.Thread(target=self._async_call_helper, kwargs={
@@ -288,8 +335,6 @@ class ApiClient():
                           headers=self._get_request_headers(), timeout=timeout,
                           stream=True)
         self.check_status_error(r, path)
-        if out_filename is None:
-            raise ValueError("out_filename must be specified.")
         with open(out_filename, 'wb') as f:
             if print_progress:
                 print(f"Downloading file {out_filename}:")
